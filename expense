@@ -1,0 +1,74 @@
+#! /usr/bin/env ruby
+
+require 'pg'
+require 'date'
+
+def list_expenses
+  expenses_db = PG.connect(dbname: "expenses")
+  expenses_table = expenses_db.exec "SELECT * FROM expenses;"
+
+  expenses_table.each do |expense|
+    amount = expense['amount']
+    amount = sprintf("%10.2f", amount)
+    puts " #{expense['id'].rjust(4)} | #{expense['created_on']} | #{amount} | #{expense['memo']}"
+  end
+end
+
+def display_info
+  puts <<-msg
+  An expense recording system
+
+  Commands:
+
+  add AMOUNT MEMO [DATE] - record a new expense
+  clear - delete all expenses
+  list - list all expenses
+  delete NUMBER - remove expense with id NUMBER
+  search QUERY - list expenses with a matching memo field
+  msg
+end
+
+def add_expense(args)
+  amount, memo, date = args
+  return nil unless validate_expense?(amount, memo)
+  if date
+    begin
+      date = Date.parse(date)
+    rescue Date::Error
+      puts "Invalid date: #{date}"
+      return nil
+    end
+  else
+    date = Date.today
+  end
+
+  sql = <<-sql
+    INSERT INTO expenses (amount, memo, created_on)
+    VALUES($1, $2, $3);
+  sql
+
+  expenses_db = PG.connect(dbname: "expenses")
+  expenses_table = expenses_db.exec_params(sql, [amount, memo, date.to_s])
+end
+
+def validate_expense?(amount, memo)
+  case
+  when !(amount && memo)
+    puts "You must provide an amount and memo."
+  when !amount.match?(/^[0-9]*([.][0-9]{0,2}){0,1}$/)
+    puts "Improperly formatted amount- Must be a number with a maximum of two decimal places."
+  else
+    true
+  end
+end
+
+command = ARGV[0]
+args = ARGV[1..-1]
+
+case command
+when nil then display_info
+when 'list' then list_expenses
+when 'add' then add_expense(args)
+else
+  puts 'Command not found'
+end
