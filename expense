@@ -2,73 +2,231 @@
 
 require 'pg'
 require 'date'
+require 'io/console'
 
-def list_expenses
-  expenses_db = PG.connect(dbname: "expenses")
-  expenses_table = expenses_db.exec "SELECT * FROM expenses;"
-
-  expenses_table.each do |expense|
-    amount = expense['amount']
-    amount = sprintf("%10.2f", amount)
-    puts " #{expense['id'].rjust(4)} | #{expense['created_on']} | #{amount} | #{expense['memo']}"
+class CLI
+  def initialize
+    @expense_data = ExpenseData.new
   end
-end
 
-def display_info
-  puts <<-msg
-  An expense recording system
+  def run(arguments)
+    command = arguments[0]
+    @args = arguments[1..-1]
 
-  Commands:
+    case command
+    when nil then expense_data.display_info
+    when 'list' then expense_data.list_expenses
+    when 'add' then add
+    when 'search'
+      query = @args.join(' ')
+      expense_data.search_expenses(query)
+    when 'delete'
+      indices = @args
+      return nil unless valid_indices?(indices)
 
-  add AMOUNT MEMO [DATE] - record a new expense
-  clear - delete all expenses
-  list - list all expenses
-  delete NUMBER - remove expense with id NUMBER
-  search QUERY - list expenses with a matching memo field
-  msg
-end
+      indices.each { |id| expense_data.delete(id) }
+    when 'clear'
+      puts "This will remove all expenses. Are you sure? (y/n)"
 
-def add_expense(args)
-  amount, memo, date = args
-  return nil unless validate_expense?(amount, memo)
-  if date
-    begin
-      date = Date.parse(date)
-    rescue Date::Error
-      puts "Invalid date: #{date}"
-      return nil
+      loop do
+        case $stdin.getch.downcase
+        when 'y'
+          expense_data.clear
+          break
+        when 'n'
+          break
+        else
+          puts "Invalid input."
+        end
+      end
+    else
+      puts 'Command not found'
     end
-  else
-    date = Date.today
   end
 
-  sql = <<-sql
-    INSERT INTO expenses (amount, memo, created_on)
-    VALUES($1, $2, $3);
-  sql
+  private
 
-  expenses_db = PG.connect(dbname: "expenses")
-  expenses_table = expenses_db.exec_params(sql, [amount, memo, date.to_s])
-end
+  attr_reader :args, :expense_data
 
-def validate_expense?(amount, memo)
-  case
-  when !(amount && memo)
-    puts "You must provide an amount and memo."
-  when !amount.match?(/^[0-9]*([.][0-9]{0,2}){0,1}$/)
-    puts "Improperly formatted amount- Must be a number with a maximum of two decimal places."
-  else
-    true
+  def valid_indices?(indices)
+    return puts "You must specify the expense id" if indices.empty?
+    return true if indices.all? { |idx| idx.match?(/[0-9]+/) }
+    invalid_idxs = indices.reject { |idx| idx.match?(/[0-9]+/) }.join(', ')
+    puts "The following IDs are not valid: #{invalid_idxs}\n" \
+         "IDs must be integer values"
+  end
+
+  def add
+    amount, memo, date = args
+    return nil unless validate_expense?(amount, memo)
+    if date
+      begin
+        date = Date.parse(date).to_s
+      rescue Date::Error
+        puts "Invalid date: #{date}"
+        return nil
+      end
+    else
+      date = Date.today.to_s
+    end
+
+    expense_data.add_expense(amount, memo, date)
+  end
+
+  def validate_expense?(amount, memo)
+    case
+    when !(amount && memo)
+      puts "You must provide an amount and memo."
+    when !amount.match?(/^[0-9]*([.][0-9]{0,2}){0,1}$/)
+      puts "Improperly formatted amount- Must be a number with a maximum of two decimal places."
+    else
+      true
+    end
   end
 end
 
-command = ARGV[0]
-args = ARGV[1..-1]
+class ExpenseData
+  def initialize
+    @expenses_db = PG.connect(dbname: "expenses")
+    setup_schema
+  end
 
-case command
-when nil then display_info
-when 'list' then list_expenses
-when 'add' then add_expense(args)
-else
-  puts 'Command not found'
+  def setup_schema
+    sql = <<-sql
+      SELECT COUNT(*) FROM information_schema.tables
+      WHERE table_schema = 'public' AND table_name = 'expenses';
+    sql
+
+    result = expenses_db.exec sql
+    table_exists = result.field_values('count')[0] == '1' ? true : false
+    return if table_exists
+
+    sql = <<-sql
+      CREATE TABLE expenses (
+        id serial PRIMARY KEY,
+        amount numeric(6, 2) NOT NULL,
+        memo text NOT NULL,
+        created_on date NOT NULL
+      );
+
+      ALTER TABLE expenses
+      ADD CONSTRAINT positive_amount_check
+      CHECK(amount > 0);
+    sql
+
+    expenses_db.exec sql
+  end
+
+  def clear
+    @expenses_db.exec "DELETE FROM expenses;"
+    puts "All expenses have been deleted."
+  end
+
+  def delete(id)
+    expense_table = @expenses_db.exec "SELECT * FROM expenses;"
+
+    unless expense_table.field_values('id').include? id
+      return puts "There is no expense with the id '#{id}'"
+    end
+
+    sql = "SELECT * FROM expenses WHERE id = $1"
+    row = expenses_db.exec_params(sql, [id])
+
+    sql = "DELETE FROM expenses WHERE id = $1"
+    expenses_db.exec_params(sql, [id])
+
+    puts "The following expense has been deleted:"
+    print_table(row)
+  end
+
+  def list_expenses
+    expenses_table = expenses_db.exec "SELECT * FROM expenses;"
+    if expenses_table.ntuples == 0
+      display_count(expenses_table)
+    else
+      sql = <<-sql
+        SELECT SUM(amount) FROM expenses;
+      sql
+
+      total = expenses_db.exec("#{sql}").values[0][0]
+      total = sprintf("%.2f", total)
+      display_count(expenses_table)
+      print_table(expenses_table)
+      puts "-" * 40
+      puts "Total" + "#{total.rjust(26)}"
+    end
+  end
+
+  def display_count(table)
+    if table.ntuples == 1
+      puts "There is 1 expense."
+    elsif table.ntuples == 0
+      puts "There are no expenses."
+    else
+      puts "There are #{table.ntuples} expenses."
+    end
+  end
+
+  def search_expenses(search_query)
+    sql = <<-sql
+      SELECT * FROM expenses
+      WHERE memo ILIKE $1
+    sql
+
+    expenses_table = expenses_db.exec_params(sql, ["%#{search_query}%"])
+
+    if expenses_table.ntuples == 0
+      display_count(expenses_table)
+    else
+      sql = <<-sql
+        SELECT SUM(amount) FROM expenses
+        WHERE memo ILIKE $1
+      sql
+
+      total = expenses_db.exec_params(sql, ["%#{search_query}%"]).values[0][0]
+      total = sprintf("%.2f", total)
+
+      display_count(expenses_table)
+      print_table(expenses_table)
+      puts "-" * 40
+      puts "Total" + "#{total.rjust(26)}"
+    end
+  end
+
+  def add_expense(amount, memo, date)
+    sql = <<-sql
+      INSERT INTO expenses (amount, memo, created_on)
+      VALUES($1, $2, $3);
+    sql
+
+    expenses_db.exec_params(sql, [amount, memo, date])
+  end
+
+  def display_info
+    puts <<-msg
+    An expense recording system
+
+    Commands:
+
+    add AMOUNT MEMO [DATE] - record a new expense
+    clear - delete all expenses
+    list - list all expenses
+    delete NUMBER - remove expense with id NUMBER
+    search QUERY - list expenses with a matching memo field
+    msg
+  end
+
+  private
+
+  def print_table(table)
+    table.each do |expense|
+      amount = expense['amount']
+      amount = sprintf("%10.2f", amount)
+      puts " #{expense['id'].rjust(4)} | #{expense['created_on']} | #{amount} | #{expense['memo']}"
+    end
+  end
+
+  attr_reader :expenses_db
 end
+
+CLI.new.run(ARGV)
